@@ -1,13 +1,6 @@
-# 🧬 HelixForge — De-Novo Genome Assembler
+# 🧬 GenomeSmith
 
 A complete genome assembler combining a **C++ DAA engine** with a **Python/Streamlit frontend** and an **interactive 3D De Bruijn graph visualizer**.
-
----
-
-## 🏗️ Architecture
-
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/89b597f8-f48d-4d7c-8682-ceb411318230" />
-
 
 ---
 
