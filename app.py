@@ -1,5 +1,5 @@
 """
-HelixForge — Genome Assembler  |  Precision Biotech Lab UI
+GenomeSmith — Genome Assembler  |  Precision Biotech Lab UI
 Run:  streamlit run app.py
 """
 
@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 import pandas as pd
 
 st.set_page_config(
-    page_title="HelixForge — Genome Assembler",
+    page_title="GenomeSmith — Genome Assembler",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -557,7 +557,7 @@ def parse_repeats(path: Path) -> list[dict]:
     current = {}
     for line in path.read_text(errors="replace").splitlines():
         s = line.strip()
-        if not s or s.startswith("=") or s.startswith("-") or s.startswith("HelixForge") \
+        if not s or s.startswith("=") or s.startswith("-") or s.startswith("GenomeSmith") \
                 or s.startswith("Assembly") or s.startswith("Min") or s.startswith("Repeats") \
                 or s.startswith("Top") or s.startswith("Rank"):
             continue
@@ -1180,7 +1180,7 @@ with tab_problem:
         <strong>Genome assembly</strong> is the job of stitching all those tiny overlapping pieces
         back into the full original sequence — with some pieces containing typos from the machine,
         and huge repeated sections that look identical no matter where you are in the genome.
-        HelixForge solves this with a 7-stage algorithmic pipeline.
+        GenomeSmith solves this with a 7-stage algorithmic pipeline.
       </p>
       <div class="problem-grid">
         <div class="prob-item">
@@ -1194,7 +1194,7 @@ with tab_problem:
           </div>
         </div>
         <div class="prob-item">
-          <div class="prob-item-title" style="color:var(--blue)">How HelixForge Solves It</div>
+          <div class="prob-item-title" style="color:var(--blue)">How GenomeSmith Solves It</div>
           <div class="prob-item-text">
             We chop every read into tiny fixed-size chunks called <strong>k-mers</strong>
             (e.g. if k=21, each chunk is 21 letters). Then we build a
@@ -1292,7 +1292,7 @@ with tab_problem:
           <div class="prob-item-text">
             Doctors use genome assembly to find mutations that cause cancer or rare diseases.
             Tools like GATK and SPAdes — used in hospitals worldwide — are built on exactly the
-            same De Bruijn graph idea that HelixForge implements.
+            same De Bruijn graph idea that GenomeSmith implements.
           </div>
         </div>
         <div class="prob-item">
@@ -1379,5 +1379,5 @@ with tab_complexity:
         ("Canonical Forms",      "For every k-mer, keep min(kmer, reverse_complement) as the 'official' version. Groups both DNA strands under one name."),
         ("Complexity Analysis",  "Every module measured both theoretically and in practice. Both recorded in stats.txt for comparison."),
     ]
-    df_aps = pd.DataFrame(aps_rows, columns=["Topic","How HelixForge uses it"])
+    df_aps = pd.DataFrame(aps_rows, columns=["Topic","How GenomeSmith uses it"])
     st.dataframe(df_aps, use_container_width=True, hide_index=True, height=530)
