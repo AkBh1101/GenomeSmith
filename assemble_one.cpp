@@ -17,487 +17,461 @@ using namespace std;
 using namespace chrono;
 
 /* =========================================================
-   TIMING
+   STOPWATCH UTILITY
    ========================================================= */
-struct Timer {
-    time_point<high_resolution_clock> t0;
-    void start() { t0 = high_resolution_clock::now(); }
-    double ms() const {
-        return duration<double, milli>(high_resolution_clock::now() - t0).count();
+struct Stopwatch {
+    time_point<high_resolution_clock> begin;
+    void reset() { begin = high_resolution_clock::now(); }
+    double elapsed_ms() const {
+        return duration<double, milli>(high_resolution_clock::now() - begin).count();
     }
 };
 
 /* =========================================================
-   REVERSE COMPLEMENT — canonical k-mer representation
-   canonical = min(kmer, rev_comp(kmer))
-   Halves graph size; correctly handles both sequencing strands.
+   COMPLEMENT UTILS
+   canonical form = lexicographic min of (kmer, its reverse complement)
+   ensures strands are handled symmetrically
    ========================================================= */
-string rev_comp(const string& s) {
-    string r; r.reserve(s.size());
-    for (int i = (int)s.size()-1; i >= 0; --i) {
-        char c = s[i];
-        if      (c=='A') r+='T';
-        else if (c=='T') r+='A';
-        else if (c=='C') r+='G';
-        else             r+='C';
-    }
-    return r;
+char complement_base(char b) {
+    if (b == 'A') return 'T';
+    if (b == 'T') return 'A';
+    if (b == 'C') return 'G';
+    return 'C';
+}
+
+string reverse_complement(const string& seq) {
+    int len = (int)seq.size();
+    string rc(len, ' ');
+    for (int i = 0; i < len; ++i)
+        rc[i] = complement_base(seq[len - 1 - i]);
+    return rc;
 }
 
 /* =========================================================
-   ROLLING HASH — Rabin-Karp  O(1) per k-mer
-   Mersenne prime MOD = 2^61-1 avoids overflow via __uint128_t.
+   POLYNOMIAL ROLLING HASH — O(1) per window slide
+   Uses Mersenne prime 2^61-1 and __uint128_t arithmetic
    ========================================================= */
-class RollingHash {
-    static constexpr uint64_t BASE = 5;
-    static constexpr uint64_t MOD  = (1ULL << 61) - 1;
-    uint64_t hv = 0, bp = 1;
-    int k;
+namespace HashConfig {
+    constexpr uint64_t RADIX = 5;
+    constexpr uint64_t PRIME = (1ULL << 61) - 1;
+}
 
-    static uint64_t cv(char c) {
-        switch(c) {
-            case 'A': return 1; case 'C': return 2;
-            case 'G': return 3; case 'T': return 4;
-        }
-        return 1;
+uint64_t base_encode(char c) {
+    switch (c) {
+        case 'A': return 1; case 'C': return 2;
+        case 'G': return 3; case 'T': return 4;
     }
-    static uint64_t mm(uint64_t a, uint64_t b) {
-        return (__uint128_t)a * b % MOD;
-    }
-public:
-    explicit RollingHash(int k) : k(k) {}
+    return 1;
+}
 
-    void init(const string& s, int pos) {
-        hv = 0; bp = 1;
-        for (int i = 0; i < k; ++i) {
-            hv = (mm(hv, BASE) + cv(s[pos+i])) % MOD;
-            if (i < k-1) bp = mm(bp, BASE);
+uint64_t mod_mul(uint64_t x, uint64_t y) {
+    return (__uint128_t)x * y % HashConfig::PRIME;
+}
+
+struct KmerHasher {
+    int window;
+    uint64_t cur_hash = 0, lead_pow = 1;
+
+    explicit KmerHasher(int w) : window(w) {}
+
+    void initialize(const string& s, int offset) {
+        cur_hash = 0; lead_pow = 1;
+        for (int i = 0; i < window; ++i) {
+            cur_hash = (mod_mul(cur_hash, HashConfig::RADIX) + base_encode(s[offset + i])) % HashConfig::PRIME;
+            if (i < window - 1)
+                lead_pow = mod_mul(lead_pow, HashConfig::RADIX);
         }
     }
-    void slide(char old_c, char new_c) {
-        hv = (hv + MOD - mm(bp, cv(old_c))) % MOD;
-        hv = (mm(hv, BASE) + cv(new_c)) % MOD;
+
+    void advance(char drop, char add) {
+        cur_hash = (cur_hash + HashConfig::PRIME - mod_mul(lead_pow, base_encode(drop))) % HashConfig::PRIME;
+        cur_hash = (mod_mul(cur_hash, HashConfig::RADIX) + base_encode(add)) % HashConfig::PRIME;
     }
-    uint64_t value() const { return hv; }
+
+    uint64_t get() const { return cur_hash; }
 };
 
 /* =========================================================
-   BLOOM FILTER — O(1) insert/query, ~8 MB
-   Two-filter scheme: only add to graph if seen at least twice.
+   PROBABILISTIC SET — Bloom Filter
+   Two-pass scheme: add to real graph only if hash seen 2+ times
+   ~8MB footprint, 3 hash functions
    ========================================================= */
-class BloomFilter {
-    static constexpr size_t BITS = 1ULL << 26;
-    vector<uint8_t> b;
-    int nh;
+struct ProbSet {
+    static constexpr size_t N_BITS = 1ULL << 26;
+    vector<uint8_t> bits;
+    int num_fns;
 
-    size_t bit(size_t h, int i) const {
-        uint64_t salt = (uint64_t)i * 2654435761ULL;
-        return ((h ^ salt) * 6364136223846793005ULL
-                          + 1442695040888963407ULL) % BITS;
+    explicit ProbSet(int fns = 3) : bits(N_BITS / 8, 0), num_fns(fns) {}
+
+    size_t probe(size_t h, int fn) const {
+        uint64_t salt = (uint64_t)fn * 2654435761ULL;
+        return ((h ^ salt) * 6364136223846793005ULL + 1442695040888963407ULL) % N_BITS;
     }
-public:
-    explicit BloomFilter(int hashes = 3) : b(BITS/8, 0), nh(hashes) {}
-    void insert(size_t h) {
-        for (int i = 0; i < nh; ++i) {
-            size_t x = bit(h,i); b[x/8] |= (1u << (x%8));
+
+    void add(size_t h) {
+        for (int i = 0; i < num_fns; ++i) {
+            size_t p = probe(h, i);
+            bits[p / 8] |= (1u << (p % 8));
         }
     }
-    bool query(size_t h) const {
-        for (int i = 0; i < nh; ++i) {
-            size_t x = bit(h,i);
-            if (!(b[x/8] & (1u << (x%8)))) return false;
+
+    bool contains(size_t h) const {
+        for (int i = 0; i < num_fns; ++i) {
+            size_t p = probe(h, i);
+            if (!(bits[p / 8] & (1u << (p % 8)))) return false;
         }
         return true;
     }
 };
 
 /* =========================================================
-   DE BRUIJN GRAPH — adjacency list
-   Node  = (k-1)-mer
-   Edge  = k-mer
-   edge_freq[u->v] = number of reads supporting that transition.
+   DE BRUIJN GRAPH
+   Nodes  = (k-1)-mers
+   Edges  = k-mers
+   Tracks per-edge frequency for coverage-weighted traversal
    ========================================================= */
-struct Graph {
-    unordered_map<string, vector<string>> adj;
-    unordered_map<string, int> indeg, outdeg;
-    unordered_map<string, int> edge_freq;     // "u->v" -> count
+struct DBGraph {
+    unordered_map<string, vector<string>> neighbors;
+    unordered_map<string, int> in_count, out_count;
+    unordered_map<string, int> freq_map;   // "u->v" -> support count
 
-    void add_edge(const string& u, const string& v) {
-        string key = u + "->" + v;
-        if (edge_freq[key]++ == 0) {          // first time: register edge
-            adj[u].push_back(v);
-            outdeg[u]++;
-            indeg[v]++;
-            if (!indeg.count(u))  indeg[u]  = 0;
-            if (!outdeg.count(v)) outdeg[v] = 0;
-            if (!adj.count(v))    adj[v];
+    void insert_edge(const string& from, const string& to) {
+        string eid = from + "->" + to;
+        if (freq_map[eid]++ == 0) {
+            neighbors[from].push_back(to);
+            out_count[from]++;
+            in_count[to]++;
+            if (!in_count.count(from))   in_count[from]  = 0;
+            if (!out_count.count(to))    out_count[to]   = 0;
+            if (!neighbors.count(to))    neighbors[to];
         }
     }
 
-    // Eulerian source: outdeg - indeg == 1, else any node with out-edges
-    string start_node() const {
-        string best;
-        for (auto& [n, od] : outdeg) {
-            int id = indeg.count(n) ? indeg.at(n) : 0;
-            if (od - id == 1)          return n;
-            if (best.empty() && od > 0) best = n;
+    string eulerian_source() const {
+        string fallback;
+        for (auto& [n, od] : out_count) {
+            int id = in_count.count(n) ? in_count.at(n) : 0;
+            if (od - id == 1) return n;
+            if (fallback.empty() && od > 0) fallback = n;
         }
-        return best;
+        return fallback;
     }
 
-    // Eulerian sink: indeg - outdeg == 1, else any node with no out-edges
-    string sink_node() const {
-        string best;
-        for (auto& [n, id] : indeg) {
-            int od = outdeg.count(n) ? outdeg.at(n) : 0;
-            if (id - od == 1)                   return n;
-            if (best.empty() && od == 0 && id > 0) best = n;
+    string eulerian_sink() const {
+        string fallback;
+        for (auto& [n, id] : in_count) {
+            int od = out_count.count(n) ? out_count.at(n) : 0;
+            if (id - od == 1) return n;
+            if (fallback.empty() && od == 0 && id > 0) fallback = n;
         }
-        return best;
+        return fallback;
     }
 
-    size_t V() const { return adj.size(); }
-    size_t E() const {
-        size_t e = 0;
-        for (auto& [n, nb] : adj) e += nb.size();
-        return e;
+    size_t node_count() const { return neighbors.size(); }
+    size_t edge_count() const {
+        size_t total = 0;
+        for (auto& [n, nb] : neighbors) total += nb.size();
+        return total;
     }
 };
 
 /* =========================================================
-   HIERHOLZER — Eulerian path  O(E)
-   Visits every edge exactly once → longest possible assembly.
+   EULERIAN PATH — Hierholzer's algorithm  O(E)
+   Each edge traversed exactly once
    ========================================================= */
-vector<string> hierholzer(Graph& g) {
-    string s = g.start_node();
-    if (s.empty()) return {};
+vector<string> find_euler_path(DBGraph& dg) {
+    string origin = dg.eulerian_source();
+    if (origin.empty()) return {};
 
-    unordered_map<string, int> idx;
-    for (auto& [n, _] : g.adj) idx[n] = 0;
+    unordered_map<string, int> ptr;
+    for (auto& [n, _] : dg.neighbors) ptr[n] = 0;
 
-    vector<string> circuit;
-    stack<string> stk;
-    stk.push(s);
+    vector<string> trail;
+    stack<string> call_stack;
+    call_stack.push(origin);
 
-    while (!stk.empty()) {
-        string v = stk.top();
-        auto& nb = g.adj[v];
-        if (idx[v] < (int)nb.size())
-            stk.push(nb[idx[v]++]);
+    while (!call_stack.empty()) {
+        string node = call_stack.top();
+        auto& adj = dg.neighbors[node];
+        if (ptr[node] < (int)adj.size())
+            call_stack.push(adj[ptr[node]++]);
         else {
-            circuit.push_back(v); stk.pop();
+            trail.push_back(node);
+            call_stack.pop();
         }
     }
-    reverse(circuit.begin(), circuit.end());
-    return circuit;
+    reverse(trail.begin(), trail.end());
+    return trail;
 }
 
 /* =========================================================
-   DIJKSTRA — Coverage-Weighted Assembly  O((V+E) log V)
-   Edge weight  = (max_freq + 1) - freq(u,v)
-                → high-coverage edges get low cost → Dijkstra
-                  naturally selects the best-supported path.
-   Returns the assembled sequence along the minimum-cost
-   (= maximum-coverage) path from source to sink.
+   COVERAGE-WEIGHTED SHORTEST PATH — Dijkstra  O((V+E) log V)
+   Edge cost = (max_freq + 1) - observed_freq
+   Low cost → high coverage → preferred path
    ========================================================= */
-string dijkstra_assemble(const Graph& g) {
-    if (g.adj.empty()) return "";
+string coverage_path_assemble(const DBGraph& dg) {
+    if (dg.neighbors.empty()) return "";
 
-    // Normalise weights: find global max frequency
-    int max_f = 1;
-    for (auto& [key, f] : g.edge_freq) max_f = max(max_f, f);
+    int peak_freq = 1;
+    for (auto& [eid, f] : dg.freq_map)
+        peak_freq = max(peak_freq, f);
 
-    string src  = g.start_node();
-    string sink = g.sink_node();
+    string src  = dg.eulerian_source();
+    string dest = dg.eulerian_sink();
     if (src.empty()) return "";
 
-    // min-heap: (accumulated_cost, node)
-    using Entry = pair<double, string>;
-    priority_queue<Entry, vector<Entry>, greater<Entry>> pq;
+    using PQEntry = pair<double, string>;
+    priority_queue<PQEntry, vector<PQEntry>, greater<PQEntry>> heap;
 
-    unordered_map<string, double> dist;
-    unordered_map<string, string> prev;
-    unordered_map<string, int>    hops;   // edge-hops from source
+    unordered_map<string, double> cost;
+    unordered_map<string, string> came_from;
+    unordered_map<string, int>    depth;
 
-    for (auto& [n, _] : g.adj) dist[n] = 1e18;
-    dist[src] = 0.0;
-    hops[src] = 0;
-    pq.push({0.0, src});
+    for (auto& [n, _] : dg.neighbors) cost[n] = 1e18;
+    cost[src]  = 0.0;
+    depth[src] = 0;
+    heap.push({0.0, src});
 
-    while (!pq.empty()) {
-        auto [d, u] = pq.top(); pq.pop();
-        if (d > dist[u] + 1e-9) continue;   // stale entry
+    while (!heap.empty()) {
+        auto [d, u] = heap.top(); heap.pop();
+        if (d > cost[u] + 1e-9) continue;
 
-        for (auto& v : g.adj.at(u)) {
-            string key  = u + "->" + v;
-            int    freq = g.edge_freq.count(key) ? g.edge_freq.at(key) : 1;
-            double w    = double(max_f + 1 - freq);  // inverse: low cost = high freq
-            double nd   = d + w;
-            if (nd < dist[v] - 1e-9) {
-                dist[v] = nd;
-                prev[v] = u;
-                hops[v] = hops.count(u) ? hops[u] + 1 : 1;
-                pq.push({nd, v});
+        for (auto& v : dg.neighbors.at(u)) {
+            string eid = u + "->" + v;
+            int fr = dg.freq_map.count(eid) ? dg.freq_map.at(eid) : 1;
+            double w = double(peak_freq + 1 - fr);
+            double nd = d + w;
+            if (nd < cost[v] - 1e-9) {
+                cost[v]      = nd;
+                came_from[v] = u;
+                depth[v]     = depth.count(u) ? depth[u] + 1 : 1;
+                heap.push({nd, v});
             }
         }
     }
 
-    // Choose endpoint: prefer declared sink if reachable;
-    // otherwise the deepest (most hops) reachable node.
-    string end_node;
-    if (!sink.empty() && dist.count(sink) && dist[sink] < 1e17) {
-        end_node = sink;
+    string endpoint;
+    if (!dest.empty() && cost.count(dest) && cost[dest] < 1e17) {
+        endpoint = dest;
     } else {
-        int best_h = 0;
-        for (auto& [n, h] : hops) {
+        int best = 0;
+        for (auto& [n, d] : depth) {
             if (n == src) continue;
-            if (dist[n] < 1e17 && h > best_h) { best_h = h; end_node = n; }
+            if (cost[n] < 1e17 && d > best) { best = d; endpoint = n; }
         }
     }
-    if (end_node.empty()) return src;
+    if (endpoint.empty()) return src;
 
-    // Reconstruct path source → end_node via prev[] pointers
-    vector<string> path;
-    for (string cur = end_node; ; cur = prev[cur]) {
-        path.push_back(cur);
-        if (!prev.count(cur)) break;
+    vector<string> route;
+    for (string cur = endpoint; ; cur = came_from[cur]) {
+        route.push_back(cur);
+        if (!came_from.count(cur)) break;
     }
-    reverse(path.begin(), path.end());
+    reverse(route.begin(), route.end());
 
-    // Stitch node labels into sequence (each subsequent node adds 1 char)
-    string seq = path[0];
-    for (size_t i = 1; i < path.size(); ++i) seq += path[i].back();
-    return seq;
+    string assembled = route[0];
+    for (size_t i = 1; i < route.size(); ++i)
+        assembled += route[i].back();
+    return assembled;
 }
 
 /* =========================================================
-   GREEDY FALLBACK — frequency-weighted edge selection
-   Picks the highest-observed-frequency neighbour at each step.
-   Used only if both Hierholzer and Dijkstra produce no output.
+   GREEDY FALLBACK — picks highest-frequency unvisited edge
    ========================================================= */
-string greedy_assemble(Graph& g) {
-    string cur = g.start_node();
-    if (cur.empty()) return "";
-    string res = cur;
-    unordered_map<string, int> used;
+string greedy_path_assemble(DBGraph& dg) {
+    string pos = dg.eulerian_source();
+    if (pos.empty()) return "";
+    string result = pos;
+    unordered_map<string, int> visited;
     while (true) {
-        string best_nxt; int best_freq = -1;
-        for (auto& nxt : g.adj[cur]) {
-            string key = cur + "->" + nxt;
-            if (!used[key]) {
-                int freq = g.edge_freq.count(key) ? g.edge_freq.at(key) : 1;
-                if (freq > best_freq) { best_freq = freq; best_nxt = nxt; }
+        string best_next; int top_freq = -1;
+        for (auto& nxt : dg.neighbors[pos]) {
+            string eid = pos + "->" + nxt;
+            if (!visited[eid]) {
+                int f = dg.freq_map.count(eid) ? dg.freq_map.at(eid) : 1;
+                if (f > top_freq) { top_freq = f; best_next = nxt; }
             }
         }
-        if (best_nxt.empty()) break;
-        used[cur + "->" + best_nxt]++;
-        res += best_nxt.back();
-        cur  = best_nxt;
+        if (best_next.empty()) break;
+        visited[pos + "->" + best_next]++;
+        result += best_next.back();
+        pos = best_next;
     }
-    return res;
+    return result;
 }
 
 /* =========================================================
-   DP ERROR CORRECTION — sliding window majority vote  O(N)
-   Fixes isolated single-base mismatches where both immediate
-   neighbours agree (classic sequencing substitution error).
+   SINGLE-PASS ERROR SMOOTHER — O(N)
+   Corrects isolated substitution errors via neighbour agreement
    ========================================================= */
-string dp_correct(const string& seq) {
-    string res = seq;
-    for (int i = 1; i < (int)seq.size()-1; i++) {
-        if (seq[i-1] == seq[i+1] && seq[i] != seq[i-1])
-            res[i] = seq[i-1];
+string smooth_sequence(const string& raw) {
+    string out = raw;
+    for (int i = 1; i + 1 < (int)raw.size(); ++i) {
+        if (raw[i - 1] == raw[i + 1] && raw[i] != raw[i - 1])
+            out[i] = raw[i - 1];
     }
-    return res;
+    return out;
 }
 
 /* =========================================================
-   GENOME METRICS
+   SEQUENCE STATISTICS
    ========================================================= */
-double gc_content(const string& s) {
+double compute_gc(const string& s) {
     if (s.empty()) return 0.0;
-    int gc = 0;
-    for (char c : s) if (c=='G' || c=='C') gc++;
-    return 100.0 * gc / (double)s.size();
+    int count = 0;
+    for (char c : s) if (c == 'G' || c == 'C') count++;
+    return 100.0 * count / (double)s.size();
 }
 
-// N50: length L such that contigs >= L bp cover >= 50% of assembly.
-// Splits on 'N' gap characters to handle multi-contig assemblies.
-long long n50(const string& seq) {
-    vector<long long> contigs;
-    long long cur = 0;
-    for (char c : seq) {
-        if (c == 'N') { if (cur > 0) contigs.push_back(cur); cur = 0; }
-        else            cur++;
+long long compute_n50(const string& assembly) {
+    vector<long long> ctgs;
+    long long run = 0;
+    for (char c : assembly) {
+        if (c == 'N') { if (run > 0) ctgs.push_back(run); run = 0; }
+        else run++;
     }
-    if (cur > 0) contigs.push_back(cur);
-    if (contigs.empty()) return 0;
+    if (run > 0) ctgs.push_back(run);
+    if (ctgs.empty()) return 0;
 
-    sort(contigs.rbegin(), contigs.rend());
+    sort(ctgs.rbegin(), ctgs.rend());
     long long total = 0;
-    for (auto l : contigs) total += l;
-    long long half = total / 2, running = 0;
-    for (auto l : contigs) { running += l; if (running >= half) return l; }
-    return contigs.back();
+    for (auto l : ctgs) total += l;
+    long long half = total / 2, acc = 0;
+    for (auto l : ctgs) { acc += l; if (acc >= half) return l; }
+    return ctgs.back();
 }
 
 /* =========================================================
-   SUFFIX ARRAY — prefix-doubling  O(n log² n)
-
-   Algorithm outline (Manber & Myers style):
-   1. Initialise SA = [0..n-1], rank[i] = s[i].
-   2. For gap = 1, 2, 4, ...:
-      Sort SA by (rank[i], rank[i+gap]) — uses the O(gap)-correct
-      ordering built in the previous round.
-      Recompute rank[] from the new sorted order.
-      Stop early once all ranks are distinct.
+   SUFFIX ARRAY — prefix doubling  O(n log² n)
+   Rank-based sort with early termination on unique ranks
    ========================================================= */
-vector<int> build_suffix_array(const string& s) {
+vector<int> suffix_array(const string& s) {
     int n = (int)s.size();
     if (n == 0) return {};
 
-    vector<int> sa(n), rank_(n), tmp(n);
-    iota(sa.begin(), sa.end(), 0);
-    for (int i = 0; i < n; i++) rank_[i] = (unsigned char)s[i];
+    vector<int> order(n), rnk(n), aux(n);
+    iota(order.begin(), order.end(), 0);
+    for (int i = 0; i < n; ++i) rnk[i] = (unsigned char)s[i];
 
     for (int gap = 1; gap < n; gap <<= 1) {
-        // Comparator: primary key = rank_[a], secondary = rank_[a+gap] (-1 if OOB)
         auto cmp = [&](int a, int b) {
-            if (rank_[a] != rank_[b]) return rank_[a] < rank_[b];
-            int ra = (a + gap < n) ? rank_[a + gap] : -1;
-            int rb = (b + gap < n) ? rank_[b + gap] : -1;
+            if (rnk[a] != rnk[b]) return rnk[a] < rnk[b];
+            int ra = (a + gap < n) ? rnk[a + gap] : -1;
+            int rb = (b + gap < n) ? rnk[b + gap] : -1;
             return ra < rb;
         };
-        sort(sa.begin(), sa.end(), cmp);
+        sort(order.begin(), order.end(), cmp);
 
-        // Rebuild ranks: sa[0] gets 0; sa[i] gets sa[i-1]'s rank + 1 if different
-        tmp[sa[0]] = 0;
-        for (int i = 1; i < n; i++)
-            tmp[sa[i]] = tmp[sa[i-1]] + (cmp(sa[i-1], sa[i]) ? 1 : 0);
-        rank_ = tmp;
-
-        // Early exit: all ranks are now unique
-        if (rank_[sa[n-1]] == n-1) break;
+        aux[order[0]] = 0;
+        for (int i = 1; i < n; ++i)
+            aux[order[i]] = aux[order[i - 1]] + (cmp(order[i - 1], order[i]) ? 1 : 0);
+        rnk = aux;
+        if (rnk[order[n - 1]] == n - 1) break;
     }
-    return sa;
+    return order;
 }
 
 /* =========================================================
-   LCP ARRAY — Kasai's algorithm  O(n)
-
-   Uses the inverse SA (rank array) to compute LCP in linear
-   time by extending each match from the previous comparison.
-   The key invariant: LCP drops by at most 1 per character,
-   so h never decreases more than n times overall.
+   LCP ARRAY — Kasai  O(n)
+   Extends each match using the rank of the previous suffix
    ========================================================= */
-vector<int> build_lcp(const string& s, const vector<int>& sa) {
+vector<int> lcp_array(const string& s, const vector<int>& sa) {
     int n = (int)s.size();
-    vector<int> rank_(n), lcp(n, 0);
-    for (int i = 0; i < n; i++) rank_[sa[i]] = i;
+    vector<int> inv(n), lcp(n, 0);
+    for (int i = 0; i < n; ++i) inv[sa[i]] = i;
 
-    for (int i = 0, h = 0; i < n; i++) {
-        if (rank_[i] > 0) {
-            int j = sa[rank_[i] - 1];
-            // Extend match character by character
-            while (i+h < n && j+h < n && s[i+h] == s[j+h]) h++;
-            lcp[rank_[i]] = h;
-            if (h > 0) h--;    // Kasai's invariant: h decreases by at most 1
+    for (int i = 0, h = 0; i < n; ++i) {
+        if (inv[i] > 0) {
+            int j = sa[inv[i] - 1];
+            while (i + h < n && j + h < n && s[i + h] == s[j + h]) h++;
+            lcp[inv[i]] = h;
+            if (h > 0) h--;
         }
     }
     return lcp;
 }
 
 /* =========================================================
-   REPEAT FINDER — LCP array scan
-
-   Two consecutive SA entries with LCP[i] >= min_len share a
-   prefix of at least min_len characters — that prefix is a
-   repeated substring.  We group maximal runs of high-LCP
-   entries into "repeat regions", extract the shared pattern,
-   and record all occurrence positions.
+   REPEAT REGION STRUCTURE
    ========================================================= */
-struct RepeatRegion {
-    string  pattern;      // the repeated substring
-    int     length;       // length of shared prefix
-    int     occurrences;  // how many times it appears
-    vector<int> positions;// start positions in assembly
+struct RepeatEntry {
+    string  motif;
+    int     span;
+    int     count;
+    vector<int> locs;
 };
 
-vector<RepeatRegion> find_repeats(const string& s,
-                                   const vector<int>& sa,
-                                   const vector<int>& lcp,
-                                   int min_len = 20) {
+/* =========================================================
+   REPEAT DETECTION — LCP-based grouping
+   Consecutive SA entries with LCP >= threshold share a prefix
+   ========================================================= */
+vector<RepeatEntry> detect_repeats(const string& s,
+                                    const vector<int>& sa,
+                                    const vector<int>& lcp,
+                                    int threshold = 20) {
     int n = (int)sa.size();
-    vector<RepeatRegion> result;
-    int orig_len = (int)s.size(); // s may have sentinel appended
+    int slen = (int)s.size();
+    vector<RepeatEntry> found;
 
     int i = 1;
     while (i < n) {
-        if (lcp[i] >= min_len) {
-            // Collect the maximal group of consecutive high-LCP entries
-            int j         = i;
-            int group_lcp = lcp[i];
-            while (j < n && lcp[j] >= min_len) {
-                group_lcp = min(group_lcp, lcp[j]);
+        if (lcp[i] >= threshold) {
+            int j = i, min_lcp = lcp[i];
+            while (j < n && lcp[j] >= threshold) {
+                min_lcp = min(min_lcp, lcp[j]);
                 j++;
             }
-            // Positions: sa[i-1], sa[i], ..., sa[j-1]
+            auto ok = [&](int p) { return p + min_lcp <= slen; };
             vector<int> positions;
-            auto valid = [&](int p) { return p + group_lcp <= orig_len; };
-            if (valid(sa[i-1])) positions.push_back(sa[i-1]);
-            for (int x = i; x < j; x++)
-                if (valid(sa[x])) positions.push_back(sa[x]);
+            if (ok(sa[i - 1])) positions.push_back(sa[i - 1]);
+            for (int x = i; x < j; ++x)
+                if (ok(sa[x])) positions.push_back(sa[x]);
 
             if ((int)positions.size() >= 2) {
-                string pat = s.substr(positions[0], group_lcp);
-                result.push_back({pat, group_lcp,
-                                  (int)positions.size(), positions});
+                string m = s.substr(positions[0], min_lcp);
+                found.push_back({m, min_lcp, (int)positions.size(), positions});
             }
             i = j;
         } else {
             i++;
         }
     }
-
-    // Sort: longest repeats first
-    sort(result.begin(), result.end(),
-         [](const RepeatRegion& a, const RepeatRegion& b) {
-             return a.length > b.length;
+    sort(found.begin(), found.end(),
+         [](const RepeatEntry& a, const RepeatEntry& b) {
+             return a.span > b.span;
          });
-    return result;
+    return found;
 }
 
 /* =========================================================
-   FASTQ STREAMING READER — O(N)
-   Reads every 4th line (sequence line), normalises to ACGT.
+   FASTQ PARSER — sequence lines only  O(N)
+   Normalises non-ACGT bases to 'A'
    ========================================================= */
-vector<string> read_fastq(const string& path, long long& nr) {
-    ifstream f(path);
-    if (!f) { cerr << "Cannot open " << path << "\n"; return {}; }
-    vector<string> reads;
-    string line; int ln = 0;
-    while (getline(f, line)) {
-        if (ln % 4 == 1) {
-            string c; c.reserve(line.size());
-            for (char ch : line) {
-                char u = toupper(ch);
-                c += (u=='A'||u=='C'||u=='G'||u=='T') ? u : 'A';
+vector<string> load_fastq(const string& filepath, long long& read_count) {
+    ifstream fin(filepath);
+    if (!fin) { cerr << "Cannot open " << filepath << "\n"; return {}; }
+    vector<string> seqs;
+    string line; int line_no = 0;
+    while (getline(fin, line)) {
+        if (line_no % 4 == 1) {
+            string clean; clean.reserve(line.size());
+            for (char c : line) {
+                char u = toupper(c);
+                clean += (u == 'A' || u == 'C' || u == 'G' || u == 'T') ? u : 'A';
             }
-            if (!c.empty()) reads.push_back(move(c));
+            if (!clean.empty()) seqs.push_back(move(clean));
         }
-        ++ln;
+        ++line_no;
     }
-    nr = reads.size();
-    return reads;
+    read_count = (long long)seqs.size();
+    return seqs;
 }
 
 /* =========================================================
-   JSON WRITER (manual, no external deps)
-   Writes graph nodes, edges, and edge frequencies for
-   the front-end visualiser.
+   JSON SERIALISER — graph export (no external deps)
    ========================================================= */
-string escape_json(const string& s) {
-    string o; o.reserve(s.size()+2);
+string json_str(const string& s) {
+    string o; o.reserve(s.size() + 2);
     o += '"';
     for (char c : s) {
         if      (c == '"')  o += "\\\"";
@@ -508,293 +482,285 @@ string escape_json(const string& s) {
     return o;
 }
 
-void write_graph_json(const string& path, const Graph& g) {
-    const int MAX_NODES = 500, MAX_EDGES = 2000;
-    ofstream f(path);
-    f << "{\n  \"nodes\": [\n";
+void export_graph_json(const string& outpath, const DBGraph& dg) {
+    const int NODE_CAP = 500, EDGE_CAP = 2000;
+    ofstream fout(outpath);
+    fout << "{\n  \"nodes\": [\n";
 
-    unordered_set<string> all_nodes;
-    for (auto& [n,_] : g.adj) all_nodes.insert(n);
-    vector<string> nodes(all_nodes.begin(), all_nodes.end());
-    if ((int)nodes.size() > MAX_NODES) nodes.resize(MAX_NODES);
+    unordered_set<string> node_set;
+    for (auto& [n, _] : dg.neighbors) node_set.insert(n);
+    vector<string> node_list(node_set.begin(), node_set.end());
+    if ((int)node_list.size() > NODE_CAP) node_list.resize(NODE_CAP);
 
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        f << "    " << escape_json(nodes[i]);
-        if (i+1 < nodes.size()) f << ",";
-        f << "\n";
+    for (size_t i = 0; i < node_list.size(); ++i) {
+        fout << "    " << json_str(node_list[i]);
+        if (i + 1 < node_list.size()) fout << ",";
+        fout << "\n";
     }
-    f << "  ],\n  \"edges\": [\n";
+    fout << "  ],\n  \"edges\": [\n";
 
-    int ecnt = 0; bool first = true;
-    for (auto& [u, nbrs] : g.adj) {
+    int ec = 0; bool first = true;
+    for (auto& [u, nbrs] : dg.neighbors) {
         for (auto& v : nbrs) {
-            if (ecnt++ >= MAX_EDGES) goto done_edges;
-            string key  = u + "->" + v;
-            int    freq = g.edge_freq.count(key) ? g.edge_freq.at(key) : 1;
-            if (!first) f << ",\n";
-            f << "    {\"from\":" << escape_json(u)
-              << ",\"to\":"      << escape_json(v)
-              << ",\"weight\":"  << freq << "}";
+            if (ec++ >= EDGE_CAP) goto end_edges;
+            string eid = u + "->" + v;
+            int fr = dg.freq_map.count(eid) ? dg.freq_map.at(eid) : 1;
+            if (!first) fout << ",\n";
+            fout << "    {\"from\":" << json_str(u)
+                 << ",\"to\":"       << json_str(v)
+                 << ",\"weight\":"   << fr << "}";
             first = false;
         }
     }
-    done_edges:
-    f << "\n  ],\n";
-    f << "  \"total_nodes\": " << g.V() << ",\n";
-    f << "  \"total_edges\": " << g.E() << "\n}\n";
+    end_edges:
+    fout << "\n  ],\n";
+    fout << "  \"total_nodes\": " << dg.node_count() << ",\n";
+    fout << "  \"total_edges\": " << dg.edge_count() << "\n}\n";
 }
 
 /* =========================================================
    REPEAT REPORT WRITER
    ========================================================= */
-void write_repeat_report(const string& path,
-                          const vector<RepeatRegion>& repeats,
-                          const string& seq,
-                          int min_len) {
-    ofstream f(path);
-    f << "HelixForge — Repeat Analysis Report\n";
-    f << string(60, '=') << "\n";
-    f << "Assembly length : " << seq.size() << " bp\n";
-    f << "Min repeat len  : " << min_len    << " bp\n";
-    f << "Repeats found   : " << repeats.size() << "\n\n";
+void write_repeat_file(const string& outpath,
+                        const vector<RepeatEntry>& reps,
+                        const string& assembly,
+                        int threshold) {
+    ofstream fout(outpath);
+    fout << "GenomeSmith — Repeat Analysis Report\n";
+    fout << string(60, '=') << "\n";
+    fout << "Assembly length : " << assembly.size() << " bp\n";
+    fout << "Min repeat len  : " << threshold       << " bp\n";
+    fout << "Repeats found   : " << reps.size()     << "\n\n";
 
-    int shown = min((int)repeats.size(), 25);
-    if (shown == 0) { f << "No repeats found at this threshold.\n"; return; }
+    int limit = min((int)reps.size(), 25);
+    if (limit == 0) { fout << "No repeats found at this threshold.\n"; return; }
 
-    f << "Top " << shown << " repeats (sorted by length):\n";
-    f << string(60, '-') << "\n";
-    f << left
-      << setw(6)  << "Rank"
-      << setw(10) << "Length"
-      << setw(14) << "Occurrences"
-      << "Positions (first 6)\n";
-    f << string(60, '-') << "\n";
+    fout << "Top " << limit << " repeats (sorted by length):\n";
+    fout << string(60, '-') << "\n";
+    fout << left
+         << setw(6)  << "Rank"
+         << setw(10) << "Length"
+         << setw(14) << "Occurrences"
+         << "Positions (first 6)\n";
+    fout << string(60, '-') << "\n";
 
-    for (int i = 0; i < shown; i++) {
-        const auto& r = repeats[i];
-        f << left
-          << setw(6)  << (i+1)
-          << setw(10) << r.length
-          << setw(14) << r.occurrences;
+    for (int i = 0; i < limit; ++i) {
+        const auto& r = reps[i];
+        fout << left << setw(6) << (i + 1)
+             << setw(10) << r.span
+             << setw(14) << r.count;
 
-        int pshow = min((int)r.positions.size(), 6);
-        f << "[ ";
-        for (int j = 0; j < pshow; j++) {
-            f << r.positions[j];
-            if (j+1 < pshow) f << ", ";
+        int show = min((int)r.locs.size(), 6);
+        fout << "[ ";
+        for (int j = 0; j < show; ++j) {
+            fout << r.locs[j];
+            if (j + 1 < show) fout << ", ";
         }
-        if ((int)r.positions.size() > 6) f << " ...";
-        f << " ]\n";
+        if ((int)r.locs.size() > 6) fout << " ...";
+        fout << " ]\n";
 
-        // Print up to 60 chars of the pattern
-        f << "  Pattern: " << r.pattern.substr(0, 60);
-        if (r.length > 60) f << "...";
-        f << "\n\n";
+        fout << "  Pattern: " << r.motif.substr(0, 60);
+        if (r.span > 60) fout << "...";
+        fout << "\n\n";
     }
 }
 
 /* =========================================================
-   MAIN — 7-stage pipeline
+   PIPELINE ENTRY POINT — 7 stages
    ========================================================= */
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         cerr << "Usage: assembler <input.fastq> <k> <output_dir>\n";
         return 1;
     }
-    string fastq_path = argv[1];
-    int    k          = stoi(argv[2]);
-    string out_dir    = argv[3];
 
-    if (k < 3 || k > 63) { cerr << "k must be in [3,63]\n"; return 1; }
-    filesystem::create_directories(out_dir);
+    string input_file = argv[1];
+    int    kmer_len   = stoi(argv[2]);
+    string out_path   = argv[3];
 
-    Timer T; T.start();
+    if (kmer_len < 3 || kmer_len > 63) {
+        cerr << "k must be in [3,63]\n"; return 1;
+    }
+    filesystem::create_directories(out_path);
 
-    /* ── Stage 1 : Read FASTQ ─────────────────────────────── */
+    Stopwatch total_clock; total_clock.reset();
+
+    /* Stage 1 — Load reads */
     cerr << "[1/7] Reading FASTQ...\n";
-    long long nr = 0;
-    auto reads = read_fastq(fastq_path, nr);
-    if (reads.empty()) { cerr << "No reads.\n"; return 1; }
-    cerr << "      " << nr << " reads loaded.\n";
+    long long num_reads = 0;
+    auto read_seqs = load_fastq(input_file, num_reads);
+    if (read_seqs.empty()) { cerr << "No reads.\n"; return 1; }
+    cerr << "      " << num_reads << " reads loaded.\n";
 
-    /* ── Stage 2 : Hash k-mers + build De Bruijn graph ────── */
+    /* Stage 2 — Bloom filter + graph construction */
     cerr << "[2/7] Hashing k-mers and building De Bruijn graph (k="
-         << k << ")...\n";
-    Timer ht; ht.start();
-    BloomFilter once(3), twice(3);
-    RollingHash rh(k);
-    long long total_kmers = 0;
+         << kmer_len << ")...\n";
 
-    // Pass 1 — populate Bloom filters to identify solid k-mers
-    for (auto& r : reads) {
-        if ((int)r.size() < k) continue;
-        rh.init(r, 0);
-        uint64_t hv = rh.value();
-        if (once.query(hv)) twice.insert(hv); else once.insert(hv);
-        ++total_kmers;
-        for (int i = 1; i+k <= (int)r.size(); ++i) {
-            rh.slide(r[i-1], r[i+k-1]); hv = rh.value();
-            if (once.query(hv)) twice.insert(hv); else once.insert(hv);
-            ++total_kmers;
+    Stopwatch bloom_clock; bloom_clock.reset();
+    ProbSet seen_once(3), seen_twice(3);
+    KmerHasher hasher(kmer_len);
+    long long kmer_total = 0;
+
+    for (auto& rd : read_seqs) {
+        if ((int)rd.size() < kmer_len) continue;
+        hasher.initialize(rd, 0);
+        uint64_t hv = hasher.get();
+        if (seen_once.contains(hv)) seen_twice.add(hv);
+        else seen_once.add(hv);
+        ++kmer_total;
+        for (int i = 1; i + kmer_len <= (int)rd.size(); ++i) {
+            hasher.advance(rd[i - 1], rd[i + kmer_len - 1]);
+            hv = hasher.get();
+            if (seen_once.contains(hv)) seen_twice.add(hv);
+            else seen_once.add(hv);
+            ++kmer_total;
         }
     }
-    double hash_ms = ht.ms();
+    double t_bloom = bloom_clock.elapsed_ms();
 
-    // Pass 2 — add only solid k-mers (seen ≥2×) as canonical graph edges
-    Timer gt; gt.start();
-    Graph g;
-    for (auto& r : reads) {
-        if ((int)r.size() < k) continue;
-        rh.init(r, 0);
-        if (twice.query(rh.value())) {
-            string km        = r.substr(0, k);
-            string canonical = min(km, rev_comp(km));
-            g.add_edge(canonical.substr(0, k-1), canonical.substr(1, k-1));
+    Stopwatch graph_clock; graph_clock.reset();
+    DBGraph dg;
+    for (auto& rd : read_seqs) {
+        if ((int)rd.size() < kmer_len) continue;
+        hasher.initialize(rd, 0);
+        if (seen_twice.contains(hasher.get())) {
+            string km  = rd.substr(0, kmer_len);
+            string can = min(km, reverse_complement(km));
+            dg.insert_edge(can.substr(0, kmer_len - 1), can.substr(1, kmer_len - 1));
         }
-        for (int i = 1; i+k <= (int)r.size(); ++i) {
-            rh.slide(r[i-1], r[i+k-1]);
-            if (twice.query(rh.value())) {
-                string km        = r.substr(i, k);
-                string canonical = min(km, rev_comp(km));
-                g.add_edge(canonical.substr(0, k-1), canonical.substr(1, k-1));
+        for (int i = 1; i + kmer_len <= (int)rd.size(); ++i) {
+            hasher.advance(rd[i - 1], rd[i + kmer_len - 1]);
+            if (seen_twice.contains(hasher.get())) {
+                string km  = rd.substr(i, kmer_len);
+                string can = min(km, reverse_complement(km));
+                dg.insert_edge(can.substr(0, kmer_len - 1), can.substr(1, kmer_len - 1));
             }
         }
     }
-    double graph_ms = gt.ms();
-    cerr << "      " << g.V() << " nodes, " << g.E() << " edges.\n";
+    double t_graph = graph_clock.elapsed_ms();
+    cerr << "      " << dg.node_count() << " nodes, " << dg.edge_count() << " edges.\n";
 
-    /* ── Stage 3 : Dijkstra coverage-weighted assembly ──────── */
+    /* Stage 3 — Dijkstra assembly */
     cerr << "[3/7] Dijkstra coverage-weighted assembly...\n";
-    Timer djt; djt.start();
-    string dijk_seq = dijkstra_assemble(g);
-    double dijk_ms  = djt.ms();
-    cerr << "      Dijkstra path  : " << dijk_seq.size() << " bp.\n";
+    Stopwatch dijk_clock; dijk_clock.reset();
+    string dijk_result = coverage_path_assemble(dg);
+    double t_dijk = dijk_clock.elapsed_ms();
+    cerr << "      Dijkstra path  : " << dijk_result.size() << " bp.\n";
 
-    /* ── Stage 4 : Hierholzer Eulerian traversal ─────────────── */
+    /* Stage 4 — Eulerian traversal */
     cerr << "[4/7] Hierholzer Eulerian traversal...\n";
-    Timer tt; tt.start();
-    auto   eul_path = hierholzer(g);
-    string hier_seq;
-    if (eul_path.size() > 1) {
-        hier_seq = eul_path[0];
-        for (size_t i = 1; i < eul_path.size(); ++i)
-            hier_seq += eul_path[i].back();
+    Stopwatch euler_clock; euler_clock.reset();
+    auto euler_nodes = find_euler_path(dg);
+    string euler_result;
+    if (euler_nodes.size() > 1) {
+        euler_result = euler_nodes[0];
+        for (size_t i = 1; i < euler_nodes.size(); ++i)
+            euler_result += euler_nodes[i].back();
     }
-    double trav_ms = tt.ms();
-    cerr << "      Hierholzer path: " << hier_seq.size() << " bp.\n";
+    double t_euler = euler_clock.elapsed_ms();
+    cerr << "      Hierholzer path: " << euler_result.size() << " bp.\n";
 
-    // Select the best sequence; fall back to greedy if both are empty
-    string seq;
-    string method_used;
-    if (hier_seq.size() >= dijk_seq.size() && !hier_seq.empty()) {
-        seq = hier_seq; method_used = "Hierholzer (Eulerian)";
-    } else if (!dijk_seq.empty()) {
-        seq = dijk_seq; method_used = "Dijkstra (coverage-weighted)";
+    string final_seq;
+    string strategy;
+    if (euler_result.size() >= dijk_result.size() && !euler_result.empty()) {
+        final_seq = euler_result; strategy = "Hierholzer (Eulerian)";
+    } else if (!dijk_result.empty()) {
+        final_seq = dijk_result; strategy = "Dijkstra (coverage-weighted)";
     } else {
         cerr << "      Both failed — falling back to greedy.\n";
-        seq = greedy_assemble(g); method_used = "Greedy (frequency-weighted)";
+        final_seq = greedy_path_assemble(dg); strategy = "Greedy (frequency-weighted)";
     }
-    cerr << "      Selected       : " << method_used
-         << " → " << seq.size() << " bp.\n";
+    cerr << "      Selected       : " << strategy << " → " << final_seq.size() << " bp.\n";
 
-    /* ── Stage 5 : DP error correction ──────────────────────── */
+    /* Stage 5 — Error smoothing */
     cerr << "[5/7] DP error correction...\n";
-    Timer dt; dt.start();
-    seq = dp_correct(seq);
-    double dp_ms = dt.ms();
+    Stopwatch dp_clock; dp_clock.reset();
+    final_seq = smooth_sequence(final_seq);
+    double t_dp = dp_clock.elapsed_ms();
 
-    /* ── Stage 6 : Suffix Array + LCP + repeat analysis ──────── */
+    /* Stage 6 — Suffix array + repeats */
     cerr << "[6/7] Building Suffix Array and LCP Array...\n";
-    Timer sat; sat.start();
+    Stopwatch sa_clock; sa_clock.reset();
 
-    // Minimum repeat length = k (repeats shorter than a k-mer are noise)
-    const int REPEAT_MIN_LEN = max(k, 15);
-    vector<int>          sa_arr, lcp_arr;
-    vector<RepeatRegion> repeats;
+    const int REP_MIN = max(kmer_len, 15);
+    vector<int>       sa_vec, lcp_vec;
+    vector<RepeatEntry> repeat_list;
 
-    if (!seq.empty()) {
-        // Append sentinel '$' (ASCII 36, smaller than A/C/G/T)
-        // so no two suffixes are identical — required by SA algorithms.
-        string sa_input = seq + "$";
-        sa_arr  = build_suffix_array(sa_input);
-        lcp_arr = build_lcp(sa_input, sa_arr);
-        repeats = find_repeats(sa_input, sa_arr, lcp_arr, REPEAT_MIN_LEN);
+    if (!final_seq.empty()) {
+        string sa_in = final_seq + "$";
+        sa_vec      = suffix_array(sa_in);
+        lcp_vec     = lcp_array(sa_in, sa_vec);
+        repeat_list = detect_repeats(sa_in, sa_vec, lcp_vec, REP_MIN);
     }
-    double sa_ms = sat.ms();
+    double t_sa = sa_clock.elapsed_ms();
     cerr << "      SA + LCP built. "
-         << repeats.size() << " repeat region(s) found"
-         << " (min_len=" << REPEAT_MIN_LEN << ").\n";
+         << repeat_list.size() << " repeat region(s) found"
+         << " (min_len=" << REP_MIN << ").\n";
 
-    /* ── Compute final metrics ───────────────────────────────── */
-    double    gc      = gc_content(seq);
-    long long n50_val = n50(seq);
-    double    total_ms = T.ms();
+    double gc_pct    = compute_gc(final_seq);
+    long long n50_bp = compute_n50(final_seq);
+    double t_total   = total_clock.elapsed_ms();
 
-    /* ── Stage 7 : Write outputs ─────────────────────────────── */
+    /* Stage 7 — Write output files */
     cerr << "[7/7] Writing outputs...\n";
 
-    // genome.fasta — 60-char wrapped FASTA
     {
-        ofstream f(out_dir + "/genome.fasta");
-        f << ">HelixForge_assembled_sequence method=" << method_used << "\n";
-        for (size_t i = 0; i < seq.size(); i += 60)
-            f << seq.substr(i, 60) << "\n";
+        ofstream fout(out_path + "/genome.fasta");
+        fout << ">GenomeSmith_assembled_sequence method=" << strategy << "\n";
+        for (size_t i = 0; i < final_seq.size(); i += 60)
+            fout << final_seq.substr(i, 60) << "\n";
     }
 
-    // stats.txt — full pipeline summary
     {
-        ofstream f(out_dir + "/stats.txt");
-        f << "=== HelixForge Assembly Statistics ===\n\n"
-          << "Input\n"
-          << "  Reads processed   : " << nr          << "\n"
-          << "  Total k-mers      : " << total_kmers << "\n"
-          << "  k-mer size (k)    : " << k           << "\n\n"
-          << "Graph\n"
-          << "  Nodes (V)         : " << g.V()  << "\n"
-          << "  Edges (E)         : " << g.E()  << "\n\n"
-          << "Assembly\n"
-          << "  Method selected   : " << method_used       << "\n"
-          << "  Dijkstra length   : " << dijk_seq.size()   << " bp\n"
-          << "  Hierholzer length : " << hier_seq.size()   << " bp\n"
-          << "  Final length      : " << seq.size()        << " bp\n"
-          << "  GC content        : " << fixed << setprecision(2)
-                                      << gc            << " %\n"
-          << "  N50               : " << n50_val       << " bp\n\n"
-          << "Repeat Analysis (Suffix Array + LCP)\n"
-          << "  Min repeat length : " << REPEAT_MIN_LEN    << " bp\n"
-          << "  Repeat regions    : " << repeats.size()    << "\n";
-        if (!repeats.empty()) {
-            f << "  Longest repeat    : " << repeats[0].length
-              << " bp (" << repeats[0].occurrences << "x)\n";
+        ofstream fout(out_path + "/stats.txt");
+        fout << "=== GenomeSmith Assembly Statistics ===\n\n"
+             << "Input\n"
+             << "  Reads processed   : " << num_reads  << "\n"
+             << "  Total k-mers      : " << kmer_total << "\n"
+             << "  k-mer size (k)    : " << kmer_len   << "\n\n"
+             << "Graph\n"
+             << "  Nodes (V)         : " << dg.node_count() << "\n"
+             << "  Edges (E)         : " << dg.edge_count() << "\n\n"
+             << "Assembly\n"
+             << "  Method selected   : " << strategy              << "\n"
+             << "  Dijkstra length   : " << dijk_result.size()   << " bp\n"
+             << "  Hierholzer length : " << euler_result.size()  << " bp\n"
+             << "  Final length      : " << final_seq.size()     << " bp\n"
+             << "  GC content        : " << fixed << setprecision(2)
+                                         << gc_pct  << " %\n"
+             << "  N50               : " << n50_bp  << " bp\n\n"
+             << "Repeat Analysis (Suffix Array + LCP)\n"
+             << "  Min repeat length : " << REP_MIN             << " bp\n"
+             << "  Repeat regions    : " << repeat_list.size()  << "\n";
+        if (!repeat_list.empty()) {
+            fout << "  Longest repeat    : " << repeat_list[0].span
+                 << " bp (" << repeat_list[0].count << "x)\n";
         }
-        f << "\nTime Complexity (Theoretical)\n"
-          << "  Rolling Hash      : O(N)           one slide per character\n"
-          << "  Bloom Filter      : O(N)           constant insert/query\n"
-          << "  Graph Build       : O(V + E)       adjacency list\n"
-          << "  Dijkstra          : O((V+E) log V) min-heap relaxation\n"
-          << "  Hierholzer        : O(E)            each edge visited once\n"
-          << "  DP Correction     : O(N)           single pass\n"
-          << "  Suffix Array      : O(n log² n)    prefix doubling\n"
-          << "  LCP Array         : O(n)           Kasai's algorithm\n"
-          << "  Repeat Finding    : O(n)           LCP scan\n"
-          << "  Overall           : O(N + (V+E) log V + n log² n)\n\n"
-          << "Execution Time (Measured)\n"
-          << "  Total             : " << total_ms << " ms\n"
-          << "  Hashing           : " << hash_ms  << " ms\n"
-          << "  Graph Build       : " << graph_ms << " ms\n"
-          << "  Dijkstra          : " << dijk_ms  << " ms\n"
-          << "  Hierholzer        : " << trav_ms  << " ms\n"
-          << "  DP Correction     : " << dp_ms    << " ms\n"
-          << "  Suffix Array+LCP  : " << sa_ms    << " ms\n";
+        fout << "\nTime Complexity (Theoretical)\n"
+             << "  Rolling Hash      : O(N)           one slide per character\n"
+             << "  Bloom Filter      : O(N)           constant insert/query\n"
+             << "  Graph Build       : O(V + E)       adjacency list\n"
+             << "  Dijkstra          : O((V+E) log V) min-heap relaxation\n"
+             << "  Hierholzer        : O(E)            each edge visited once\n"
+             << "  DP Correction     : O(N)           single pass\n"
+             << "  Suffix Array      : O(n log² n)    prefix doubling\n"
+             << "  LCP Array         : O(n)           Kasai's algorithm\n"
+             << "  Repeat Finding    : O(n)           LCP scan\n"
+             << "  Overall           : O(N + (V+E) log V + n log² n)\n\n"
+             << "Execution Time (Measured)\n"
+             << "  Total             : " << t_total << " ms\n"
+             << "  Hashing           : " << t_bloom << " ms\n"
+             << "  Graph Build       : " << t_graph << " ms\n"
+             << "  Dijkstra          : " << t_dijk  << " ms\n"
+             << "  Hierholzer        : " << t_euler << " ms\n"
+             << "  DP Correction     : " << t_dp    << " ms\n"
+             << "  Suffix Array+LCP  : " << t_sa    << " ms\n";
     }
 
-    // graph_data.json — nodes + weighted edges for visualiser
-    write_graph_json(out_dir + "/graph_data.json", g);
+    export_graph_json(out_path + "/graph_data.json", dg);
+    write_repeat_file(out_path + "/repeats.txt", repeat_list, final_seq, REP_MIN);
 
-    // repeats.txt — detailed repeat report
-    write_repeat_report(out_dir + "/repeats.txt", repeats, seq, REPEAT_MIN_LEN);
-
-    cerr << "Done in " << total_ms << " ms.\n";
+    cerr << "Done in " << t_total << " ms.\n";
     cerr << "Outputs: genome.fasta  stats.txt  graph_data.json  repeats.txt\n";
     return 0;
 }
